@@ -1,0 +1,527 @@
+/**
+ * Shelly Gen1 Single Cover PM Parent
+ *
+ * Parent driver for Gen 1 single-cover Shelly devices with power monitoring.
+ * Examples: Shelly 2.5 (roller mode)
+ *
+ * Architecture:
+ * - Creates zero children (single cover handled directly on parent device)
+ * - Parses Gen 1 action URL callbacks (GET only, no POST scripts)
+ * - Delegates commands to parent app via componentOpen/componentClose/etc.
+ * - Power monitoring and position data obtained via polling (no scripts on Gen 1)
+ *
+ * Version: 1.0.0
+ * Local cover/dimmer fix: 2026-10-03. Driver identity intentionally unchanged.
+ */
+
+metadata {
+  definition(name: 'Shelly Gen1 Single Cover PM Parent v1.0.100', namespace: 'ShellyDeviceManager', author: 'Daniel Winks', singleThreaded: false, importUrl: '') {
+    capability 'WindowShade'
+    capability 'Switch'
+    capability 'SwitchLevel'
+    //Attributes: windowShade - ENUM ["opening", "partially open", "closed", "open", "closing", "unknown"]
+    //            position - NUMBER, unit:%
+    //Commands: open(), close(), setPosition(position)
+
+    capability 'Initialize'
+    //Commands: initialize()
+
+    capability 'Configuration'
+    //Commands: configure()
+
+    capability 'Refresh'
+    //Commands: refresh()
+
+    capability 'CurrentMeter'
+    //Attributes: amperage - NUMBER, unit:A
+
+    capability 'PowerMeter'
+    //Attributes: power - NUMBER, unit:W
+
+    capability 'VoltageMeasurement'
+    //Attributes: voltage - NUMBER, unit:V
+
+    capability 'EnergyMeter'
+    //Attributes: energy - NUMBER, unit:kWh
+
+    command 'stopPositionChange'
+    command 'reinitializeDevice'
+  }
+}
+
+preferences {
+  input name: 'logLevel', type: 'enum', title: 'Logging Level',
+    options: ['trace':'Trace', 'debug':'Debug', 'info':'Info', 'warn':'Warning'],
+    defaultValue: 'debug', required: true
+  input name: 'pollInterval', type: 'number', title: 'Polling Interval (seconds, 0 = disabled)',
+    description: 'How often to poll for status updates. Minimum 10 seconds. 0 disables polling.',
+    defaultValue: 0, range: '0..3600', required: false
+}
+
+import groovy.transform.CompileStatic
+import groovy.json.JsonOutput
+import groovy.transform.Field
+
+@Field static Boolean NOCHILDCOVER = true
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  Driver Lifecycle and Configuration                          ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+/**
+ * Called when driver is first installed on a device.
+ */
+void installed() {
+  logDebug('Parent device installed')
+  initialize()
+}
+
+/**
+ * Called when device settings are saved.
+ */
+void updated() {
+  logDebug('Parent device updated')
+  initialize()
+}
+
+/**
+ * Configures periodic polling schedule based on user preference.
+ * Clamps minimum interval to 10 seconds to prevent excessive polling.
+ */
+private void schedulePolling() {
+  unschedule('scheduledPoll')
+  Integer interval = (settings?.pollInterval ?: 0) as Integer
+  if (interval > 0) {
+    if (interval < 10) { interval = 10 }
+    String cronExpr
+    if (interval < 60) {
+      cronExpr = "0/${interval} * * ? * *"
+    } else {
+      Integer minutes = (Integer)(interval / 60)
+      cronExpr = "0 0/${minutes} * ? * *"
+    }
+    schedule(cronExpr, 'scheduledPoll')
+    logDebug("Polling scheduled every ${interval}s")
+  }
+}
+
+/**
+ * Called by the scheduled job to trigger a status poll via the parent app.
+ */
+void scheduledPoll() {
+  logDebug('scheduledPoll() triggered')
+  parent?.componentRefresh(device)
+}
+
+/**
+ * Initializes the parent device driver.
+ */
+void initialize() {
+  logDebug('Parent device initialized (cover/dimmer fix 2026-10-03)')
+  schedulePolling()
+  runIn(1, 'refresh', [overwrite: true])
+}
+
+/**
+ * Configures the device driver settings.
+ */
+void configure() {
+  logDebug('configure() called')
+  parent?.componentConfigure(device)
+}
+
+/**
+ * Refreshes the device state by querying the parent app.
+ * App will poll the Gen 1 device via GET /status and call distributeStatus().
+ */
+void refresh() {
+  logDebug('refresh() called')
+  parent?.componentRefresh(device)
+}
+
+/**
+ * Triggers device reinitialization via the parent app.
+ */
+void reinitializeDevice() {
+  logDebug('reinitializeDevice() called')
+  parent?.reinitializeDevice(device)
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  END Driver Lifecycle and Configuration                      ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  LAN Message Parsing and Event Routing                       ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+/**
+ * Parses incoming LAN messages from the Gen 1 Shelly device.
+ * Gen 1 action URLs fire GET requests only — no POST body from scripts.
+ *
+ * @param description Raw LAN message description string from Hubitat
+ */
+void parse(String description) {
+  try {
+    Map msg = parseLanMessage(description)
+    if (shouldLogLevel('trace')) { parent?.componentLogParsedMessage(device, msg) }
+
+    if (msg?.status != null) { return }
+    checkAndUpdateSourceIp(msg)
+
+    Map params = parseWebhookPath(msg)
+    if (params?.dst) {
+      logDebug("Action URL callback dst=${params.dst}, cid=${params.cid}")
+      routeActionUrlCallback(params)
+    } else {
+      logDebug("No dst found in action URL callback — headers keys: ${msg?.headers?.keySet()}, raw header present: ${msg?.header != null}")
+    }
+  } catch (Exception e) {
+    logError("Error parsing LAN message: ${e.message}")
+  }
+}
+
+/**
+ * Parses webhook GET request path to extract dst and cid from URL segments.
+ * GET Action Webhooks encode state in the path (e.g., /cover_open/0).
+ * Falls back to raw header string if parsed headers Map lacks the request line.
+ *
+ * @param msg The parsed LAN message map from parseLanMessage()
+ * @return Map with dst and cid keys, or null if not parseable
+ */
+@CompileStatic
+private Map parseWebhookPath(Map msg) {
+  String requestLine = null
+
+  // Primary: search parsed headers Map for request line
+  if (msg?.headers) {
+    requestLine = ((Map)msg.headers).keySet()?.find { Object key ->
+      key.toString().startsWith('GET ') || key.toString().startsWith('POST ')
+    }?.toString()
+  }
+
+  // Fallback: parse raw header string (singular msg.header)
+  if (!requestLine && msg?.header) {
+    String rawHeader = msg.header.toString()
+    String[] lines = rawHeader.split('\n')
+    for (String line : lines) {
+      String trimmed = line.trim()
+      if (trimmed.startsWith('GET ') || trimmed.startsWith('POST ')) {
+        requestLine = trimmed
+        break
+      }
+    }
+  }
+
+  if (!requestLine) { return null }
+
+  String[] requestParts = requestLine.split(' ')
+  if (requestParts.length < 2) { return null }
+  String pathAndQuery = requestParts[1]
+
+  // Strip leading slash
+  String webhookPath = pathAndQuery.startsWith('/') ? pathAndQuery.substring(1) : pathAndQuery
+  if (!webhookPath) { return null }
+
+  // Defensive: strip query string if somehow present
+  int qMarkIdx = webhookPath.indexOf('?')
+  if (qMarkIdx >= 0) { webhookPath = webhookPath.substring(0, qMarkIdx) }
+
+  String[] segments = webhookPath.split('/')
+  if (segments.length < 2) { return null }
+
+  Map result = [dst: segments[0], cid: segments[1]]
+
+  // Parse key/value pairs from remaining path segments
+  for (int i = 2; i + 1 < segments.length; i += 2) {
+    result[segments[i]] = segments[i + 1]
+  }
+
+  return result
+}
+
+/**
+ * Converts a hex-encoded IP address string to dotted-decimal format.
+ *
+ * @param hex The 8-character hex string (e.g., "C0A80164")
+ * @return Dotted-decimal IP (e.g., "192.168.1.100"), or null if invalid
+ */
+@CompileStatic
+private static String convertHexToIP(String hex) {
+  if (!hex || hex.length() != 8) { return null }
+  return [Integer.parseInt(hex[0..1], 16),
+          Integer.parseInt(hex[2..3], 16),
+          Integer.parseInt(hex[4..5], 16),
+          Integer.parseInt(hex[6..7], 16)].join('.')
+}
+
+/**
+ * Checks the source IP of an incoming LAN message against the stored device IP.
+ * If different, updates the device data value and notifies the parent app.
+ *
+ * @param msg The parsed LAN message map from parseLanMessage()
+ */
+private void checkAndUpdateSourceIp(Map msg) {
+  String hexIp = msg?.ip
+  if (!hexIp) { return }
+  String sourceIp = convertHexToIP(hexIp)
+  if (!sourceIp) { return }
+  String storedIp = device.getDataValue('ipAddress')
+  if (!storedIp || sourceIp == storedIp) { return }
+  logWarn("Device IP changed: ${storedIp} -> ${sourceIp}")
+  device.updateDataValue('ipAddress', sourceIp)
+  parent?.componentNotifyIpChanged(device, storedIp, sourceIp)
+}
+
+/**
+ * Routes Gen 1 action URL callbacks to appropriate event handlers.
+ * Gen 1 cover action URLs: roller_open_url, roller_close_url, roller_stop_url.
+ * After handling state change, triggers a refresh to get position/power data.
+ *
+ * @param params Map with dst and cid from the action URL path
+ */
+private void routeActionUrlCallback(Map params) {
+  switch (params.dst) {
+    case 'cover_open':
+    case 'cover_close':
+    case 'cover_stop':
+      // Action callbacks do not carry position. Read the actual endpoint/motion
+      // instead of guessing a position or calling every stop partially open.
+      parent?.componentRefresh(device)
+      runIn(1, 'refresh', [overwrite: true])
+      break
+    case 'cover_opening':
+      sendEvent(name: 'windowShade', value: 'opening', descriptionText: 'Window shade is opening')
+      logInfo('Cover state changed to: opening')
+      break
+    case 'cover_closing':
+      sendEvent(name: 'windowShade', value: 'closing', descriptionText: 'Window shade is closing')
+      logInfo('Cover state changed to: closing')
+      break
+
+    default:
+      logDebug("routeActionUrlCallback: unhandled dst=${params.dst}")
+  }
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  END LAN Message Parsing and Event Routing                   ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  Cover Commands                                              ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+/**
+ * Opens the window shade / cover.
+ * Delegates to parent app which sends GET /roller/0?go=open.
+ */
+void open() {
+  logDebug('open() called')
+  parent?.componentOpen(device)
+  runIn(1, 'refresh', [overwrite: true])
+}
+
+/**
+ * Closes the window shade / cover.
+ * Delegates to parent app which sends GET /roller/0?go=close.
+ */
+void close() {
+  logDebug('close() called')
+  parent?.componentClose(device)
+  runIn(1, 'refresh', [overwrite: true])
+}
+
+// Dimmer tile and Rule Machine adapters. On opens fully; off closes fully.
+void on() { open() }
+void off() { close() }
+
+void setLevel(BigDecimal level, BigDecimal duration = null) {
+  if (duration != null) {
+    logDebug('setLevel: dimmer transition duration is ignored for a roller')
+  }
+  setPosition(level)
+}
+
+/**
+ * Sets the cover position to a specific value.
+ * Delegates to parent app which sends GET /roller/0?go=to_pos&roller_pos={pos}.
+ *
+ * @param position Target position (0 = closed, 100 = open)
+ */
+void setPosition(BigDecimal position) {
+  if (position == null) {
+    logWarn('setPosition: position is required')
+    return
+  }
+  Integer target = Math.max(0, Math.min(100, position.intValue()))
+  logDebug("setPosition(${target}) called")
+  parent?.componentSetPosition(device, target)
+  // Never publish a requested position as if the motor had already reached it.
+  runIn(1, 'refresh', [overwrite: true])
+}
+
+/**
+ * Stops any in-progress cover movement.
+ * Delegates to parent app which sends GET /roller/0?go=stop.
+ */
+void stopPositionChange() {
+  logDebug('stopPositionChange() called')
+  parent?.componentStop(device)
+  runIn(1, 'refresh', [overwrite: true])
+}
+
+/**
+ * Starts cover movement in the given direction (WindowShade capability command).
+ * Without this method the Hubitat UI button throws MissingMethodException.
+ *
+ * @param direction Either 'open' or 'close'
+ */
+void startPositionChange(String direction) {
+  logDebug("startPositionChange(${direction}) called")
+  if (direction == 'open') { open() }
+  else if (direction == 'close') { close() }
+  else { logWarn("startPositionChange: unknown direction '${direction}'") }
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  END Cover Commands                                          ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  Status Distribution                                         ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+/**
+ * Distributes polled status data to the device.
+ * Called by the parent app after polling GET /status on the Gen 1 device.
+ * Handles cover state, position, and power monitoring values.
+ *
+ * @param status Map of normalized component statuses
+ */
+void distributeStatus(Map status) {
+  logDebug("distributeStatus() called with: ${status}")
+  if (!status) { return }
+
+  status.each { k, v ->
+    String key = k.toString()
+    if (key != 'cover:0' || !(v instanceof Map)) { return }
+
+    Map data = v as Map
+
+    // Only valid measured positions update the dashboard/automation attributes.
+    Integer position = validCoverPosition(data.current_pos)
+    if (position != null) {
+      sendEvent(name: 'position', value: position, unit: '%', descriptionText: "Position is ${position}%")
+      sendEvent(name: 'level', value: position, unit: '%')
+      sendEvent(name: 'switch', value: position == 0 ? 'off' : 'on')
+      logDebug("Cover position/level: ${position}%, switch: ${position == 0 ? 'off' : 'on'}")
+    } else {
+      logDebug("No valid cover position in status (${data.current_pos}); retaining last measured position/level")
+    }
+
+    // Gen1 open/close describe motion; stopped endpoints depend on position.
+    if (data.state != null) {
+      String shadeState = mapCoverState(data.state.toString(), position)
+      sendEvent(name: 'windowShade', value: shadeState, descriptionText: "Window shade is ${shadeState}")
+      logInfo("Cover state: ${shadeState}")
+    }
+
+    // Power monitoring
+    if (data.apower != null) {
+      sendEvent(name: 'power', value: data.apower as BigDecimal, unit: 'W')
+    }
+    // The v1.0.100 app keeps Gen1 supply voltage outside cover:0.
+    def voltage = data.voltage != null ? data.voltage : status.deviceVoltage
+    if (voltage != null) {
+      sendEvent(name: 'voltage', value: voltage as BigDecimal, unit: 'V')
+    }
+    if (data.current != null) {
+      sendEvent(name: 'amperage', value: data.current as BigDecimal, unit: 'A')
+    }
+    if (data.aenergy?.total != null) {
+      BigDecimal energyKwh = (data.aenergy.total as BigDecimal) / 1000.0
+      sendEvent(name: 'energy', value: energyKwh, unit: 'kWh')
+    }
+  }
+}
+
+/**
+ * Maps a Gen 1 roller state string to a Hubitat windowShade value.
+ *
+ * @param coverState The Gen 1 roller state (open, close, stop)
+ * @return The Hubitat windowShade state string
+ */
+@CompileStatic
+private String mapCoverState(String coverState, Integer position) {
+  switch (coverState) {
+    case 'open': return 'opening'
+    case 'close': return 'closing'
+    case 'closed': return 'closed'
+    case 'stop':
+    case 'stopped':
+      return position == null ? 'unknown' :
+          position == 0 ? 'closed' : position == 100 ? 'open' : 'partially open'
+    case 'opening': return 'opening'
+    case 'closing': return 'closing'
+    default: return 'unknown'
+  }
+}
+
+/** Reject absent, invalid (-1), and malformed positions without losing meter updates. */
+private Integer validCoverPosition(Object rawPosition) {
+  if (rawPosition == null) { return null }
+  try {
+    BigDecimal position = new BigDecimal(rawPosition.toString())
+    if (position < 0 || position > 100) { return null }
+    return position.intValue()
+  } catch (Exception ignored) {
+    return null
+  }
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  END Status Distribution                                     ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  Logging Helpers                                             ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+String loggingLabel() {
+  return "${device.displayName}"
+}
+
+private Boolean shouldLogLevel(String messageLevel) {
+  if (messageLevel == 'error') { return true }
+  else if (messageLevel == 'warn') { return ['warn', 'info', 'debug', 'trace'].contains(settings.logLevel) }
+  else if (messageLevel == 'info') { return ['info', 'debug', 'trace'].contains(settings.logLevel) }
+  else if (messageLevel == 'debug') { return ['debug', 'trace'].contains(settings.logLevel) }
+  else if (messageLevel == 'trace') { return settings.logLevel == 'trace' }
+  return false
+}
+
+void logError(message) { log.error "${loggingLabel()}: ${message}" }
+void logWarn(message) { log.warn "${loggingLabel()}: ${message}" }
+void logInfo(message) { if (shouldLogLevel('info')) { log.info "${loggingLabel()}: ${message}" } }
+void logDebug(message) { if (shouldLogLevel('debug')) { log.debug "${loggingLabel()}: ${message}" } }
+void logTrace(message) { if (shouldLogLevel('trace')) { log.trace "${loggingLabel()}: ${message}" } }
+
+@CompileStatic
+void logJson(Map message) {
+  if (shouldLogLevel('trace')) {
+    logTrace(JsonOutput.prettyPrint(JsonOutput.toJson(message)))
+  }
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  END Logging Helpers                                         ║
+// ╚══════════════════════════════════════════════════════════════╝
